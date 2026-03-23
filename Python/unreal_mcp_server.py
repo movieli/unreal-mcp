@@ -1,3 +1,104 @@
+# -*- coding: utf-8 -*-
+# Fix Unicode encoding issues on Windows BEFORE importing anything else
+import sys
+import os
+
+
+class _SafeTextStream:
+    """Wrap a text stream and fall back to replacement output on encoding failures."""
+
+    def __init__(self, stream, fallback_encoding: str = "utf-8"):
+        self._stream = stream
+        self._fallback_encoding = fallback_encoding
+
+    def write(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+
+        try:
+            return self._stream.write(text)
+        except UnicodeEncodeError:
+            encoding = getattr(self._stream, "encoding", None) or self._fallback_encoding
+            safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+            return self._stream.write(safe_text)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        return self._stream.flush()
+
+    def isatty(self):
+        return self._stream.isatty()
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def writable(self):
+        return self._stream.writable()
+
+    @property
+    def buffer(self):
+        return getattr(self._stream, "buffer", None)
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", self._fallback_encoding)
+
+    @property
+    def errors(self):
+        return getattr(self._stream, "errors", "replace")
+
+    def reconfigure(self, *args, **kwargs):
+        reconfigure = getattr(self._stream, "reconfigure", None)
+        if reconfigure is not None:
+            return reconfigure(*args, **kwargs)
+        return None
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+# Set environment variables immediately before any other imports
+if sys.platform == 'win32':
+    os.environ['PYTHONIOENCODING'] = 'utf-8'
+    os.environ['PYTHONUTF8'] = '1'
+    os.environ['PYTHONLEGACYWINDOWSSTDIO'] = 'utf-8'
+    
+    # Try to set console code page to UTF-8
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.SetConsoleCP(65001)
+        kernel32.SetConsoleOutputCP(65001)
+    except Exception:
+        pass
+    
+    # Reconfigure and wrap stdout/stderr so dependency logging cannot crash on GBK consoles.
+    try:
+        for stream_name in ('stdout', 'stderr', '__stdout__', '__stderr__'):
+            stream = getattr(sys, stream_name, None)
+            if stream is None:
+                continue
+
+            reconfigure = getattr(stream, 'reconfigure', None)
+            if reconfigure is not None:
+                try:
+                    reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+                except Exception:
+                    pass
+
+            setattr(sys, stream_name, _SafeTextStream(stream))
+    except Exception:
+        pass
+    
+    # Also set the default encoding for open() function
+    try:
+        import locale
+        locale.setlocale(locale.LC_ALL, '')
+    except Exception:
+        pass
+
 """
 Unreal Engine MCP Server
 
@@ -6,7 +107,6 @@ A simple MCP server for interacting with Unreal Engine.
 
 import logging
 import socket
-import sys
 import json
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Any, Optional
@@ -334,6 +434,17 @@ def info():
     
     ## Project Tools
     - `create_input_mapping(action_name, key, input_type)` - Create input mappings
+    - `create_data_asset(name, asset_class, package_path="/Game/Data")` - Create a native data asset
+    - `create_data_table(name, row_struct, package_path="/Game/Data")` - Create a DataTable asset
+    - `configure_enemy_template_table(asset_path, rows)` - Fill an enemy template DataTable with row data
+    - `delete_asset(asset_path)` - Delete an Unreal asset by content path
+    - `rename_asset(asset_path, new_asset_path)` - Rename or move an Unreal asset
+    - `configure_level_stage_asset(asset_path, ..., enemy_waves=[])` - Fill a LevelStageDataAsset with stage config fields
+    - `set_blueprint_class_default_property(blueprint_name, property_name, property_value)` - Set a Blueprint CDO property
+    - `set_world_settings_property(property_name, property_value)` - Set and save a WorldSettings property on the current map
+    - `start_play_in_editor()` - Start PIE for the current level
+    - `stop_play_in_editor()` - Stop the active PIE session
+    - `is_in_play_in_editor()` - Query whether PIE is currently active
     
     ## Best Practices
     
