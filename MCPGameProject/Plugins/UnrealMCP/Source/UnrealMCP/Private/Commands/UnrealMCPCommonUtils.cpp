@@ -25,6 +25,8 @@
 #include "BlueprintActionDatabase.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
+#include "Misc/App.h"
+#include "UObject/SoftObjectPtr.h"
 
 // JSON Utilities
 TSharedPtr<FJsonObject> FUnrealMCPCommonUtils::CreateErrorResponse(const FString& Message)
@@ -702,8 +704,166 @@ bool FUnrealMCPCommonUtils::SetObjectProperty(UObject* Object, const FString& Pr
             }
         }
     }
-    
-    OutErrorMessage = FString::Printf(TEXT("Unsupported property type: %s for property %s"), 
+    else if (Property->IsA<FClassProperty>())
+    {
+        FClassProperty* ClassProp = CastField<FClassProperty>(Property);
+        if (!ClassProp)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Failed to cast to FClassProperty for %s"), *PropertyName);
+            return false;
+        }
+
+        if (Value->Type == EJson::String)
+        {
+            FString ClassName = Value->AsString();
+
+            if (ClassName.IsEmpty() || ClassName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+            {
+                // Allow clearing the class reference
+                ClassProp->SetPropertyValue(PropertyAddr, nullptr);
+                UE_LOG(LogTemp, Display, TEXT("Cleared class property %s"), *PropertyName);
+                return true;
+            }
+
+            // Try multiple lookup strategies to find the UClass
+            UClass* FoundClass = nullptr;
+
+            // 1) Try FindObject with the name as-is (e.g. "ATankAIController")
+            FoundClass = FindObject<UClass>(ANY_PACKAGE, *ClassName);
+
+            // 2) If not found, try without leading 'A' prefix (common Unreal convention)
+            if (!FoundClass && ClassName.Len() > 1 && ClassName[0] == TEXT('A'))
+            {
+                FString WithoutPrefix = ClassName.Mid(1);
+                FoundClass = FindObject<UClass>(ANY_PACKAGE, *WithoutPrefix);
+            }
+
+            // 3) If not found, try adding 'A' prefix
+            if (!FoundClass && !ClassName.StartsWith(TEXT("A")))
+            {
+                FString WithPrefix = TEXT("A") + ClassName;
+                FoundClass = FindObject<UClass>(ANY_PACKAGE, *WithPrefix);
+            }
+
+            // 4) Try LoadClass from /Script/Engine and /Script/<ProjectName>
+            if (!FoundClass)
+            {
+                FString ClassNameForPath = ClassName;
+                if (ClassNameForPath.Len() > 1 && ClassNameForPath[0] == TEXT('A'))
+                {
+                    // Keep it with the A prefix for LoadClass
+                }
+
+                FString EnginePath = FString::Printf(TEXT("/Script/Engine.%s"), *ClassNameForPath);
+                FoundClass = LoadObject<UClass>(nullptr, *EnginePath);
+
+                if (!FoundClass)
+                {
+                    // Try project module — use the project name from the running module
+                    FString ProjectPath = FString::Printf(TEXT("/Script/%s.%s"), FApp::GetProjectName(), *ClassNameForPath);
+                    FoundClass = LoadObject<UClass>(nullptr, *ProjectPath);
+                }
+            }
+
+            // 5) Try as a full asset path (e.g. /Script/MyProject.ATankAIController or a Blueprint path)
+            if (!FoundClass)
+            {
+                FoundClass = LoadObject<UClass>(nullptr, *ClassName);
+            }
+
+            // 6) Try loading as a Blueprint-generated class (e.g. /Game/Blueprints/BP_MyAIController)
+            if (!FoundClass)
+            {
+                FString BPPath = ClassName;
+                if (!BPPath.EndsWith(TEXT("_C")))
+                {
+                    BPPath += TEXT("_C");
+                }
+                FoundClass = LoadObject<UClass>(nullptr, *BPPath);
+            }
+
+            if (!FoundClass)
+            {
+                OutErrorMessage = FString::Printf(TEXT("Could not find class '%s' for property '%s'"), *ClassName, *PropertyName);
+                return false;
+            }
+
+            // Validate that the found class is compatible with the property's meta class
+            UClass* MetaClass = ClassProp->MetaClass;
+            if (MetaClass && !FoundClass->IsChildOf(MetaClass))
+            {
+                OutErrorMessage = FString::Printf(TEXT("Class '%s' is not a subclass of '%s' (required by property '%s')"),
+                    *FoundClass->GetName(), *MetaClass->GetName(), *PropertyName);
+                return false;
+            }
+
+            ClassProp->SetPropertyValue(PropertyAddr, FoundClass);
+            UE_LOG(LogTemp, Display, TEXT("Set class property %s to %s"), *PropertyName, *FoundClass->GetPathName());
+            return true;
+        }
+        else if (Value->Type == EJson::Null)
+        {
+            ClassProp->SetPropertyValue(PropertyAddr, nullptr);
+            UE_LOG(LogTemp, Display, TEXT("Cleared class property %s (null)"), *PropertyName);
+            return true;
+        }
+        else
+        {
+            OutErrorMessage = FString::Printf(TEXT("Class property '%s' requires a string class name or null, got JSON type %d"),
+                *PropertyName, static_cast<int32>(Value->Type));
+            return false;
+        }
+    }
+    else if (Property->IsA<FSoftClassProperty>())
+    {
+        FSoftClassProperty* SoftClassProp = CastField<FSoftClassProperty>(Property);
+        if (!SoftClassProp)
+        {
+            OutErrorMessage = FString::Printf(TEXT("Failed to cast to FSoftClassProperty for %s"), *PropertyName);
+            return false;
+        }
+
+        if (Value->Type == EJson::String)
+        {
+            FString ClassName = Value->AsString();
+            if (ClassName.IsEmpty() || ClassName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+            {
+                FSoftObjectPtr* SoftPtr = static_cast<FSoftObjectPtr*>(PropertyAddr);
+                *SoftPtr = FSoftObjectPtr();
+                return true;
+            }
+
+            // Try to find the class
+            UClass* FoundClass = FindObject<UClass>(ANY_PACKAGE, *ClassName);
+            if (!FoundClass && ClassName.Len() > 1 && ClassName[0] == TEXT('A'))
+            {
+                FoundClass = FindObject<UClass>(ANY_PACKAGE, *ClassName.Mid(1));
+            }
+            if (!FoundClass && !ClassName.StartsWith(TEXT("A")))
+            {
+                FoundClass = FindObject<UClass>(ANY_PACKAGE, *(TEXT("A") + ClassName));
+            }
+
+            if (FoundClass)
+            {
+                FSoftObjectPtr* SoftPtr = static_cast<FSoftObjectPtr*>(PropertyAddr);
+                *SoftPtr = FSoftObjectPtr(FoundClass);
+                UE_LOG(LogTemp, Display, TEXT("Set soft class property %s to %s"), *PropertyName, *FoundClass->GetPathName());
+                return true;
+            }
+
+            OutErrorMessage = FString::Printf(TEXT("Could not find class '%s' for soft class property '%s'"), *ClassName, *PropertyName);
+            return false;
+        }
+        else if (Value->Type == EJson::Null)
+        {
+            FSoftObjectPtr* SoftPtr = static_cast<FSoftObjectPtr*>(PropertyAddr);
+            *SoftPtr = FSoftObjectPtr();
+            return true;
+        }
+    }
+
+    OutErrorMessage = FString::Printf(TEXT("Unsupported property type: %s for property %s"),
                                     *Property->GetClass()->GetName(), *PropertyName);
     return false;
 } 
